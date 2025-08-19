@@ -1,5 +1,3 @@
-# nbc.py  (single-file pipeline)
-
 import os, json, time, string, random
 import numpy as np
 import torch
@@ -158,7 +156,9 @@ if __name__ == "__main__":
     loss_fn = nn.CrossEntropyLoss()
 
     best_val, best_state = 0.0, None
-    epochs = 8
+    epochs = 20
+    train_losses, val_losses, val_accuracies = [], [], []
+
     for ep in range(1, epochs+1):
         model.train(); tr_loss = 0; c = 0
         for xb, yb in tr_dl:
@@ -166,6 +166,8 @@ if __name__ == "__main__":
             loss = loss_fn(model(xb), yb)
             opt.zero_grad(); loss.backward(); opt.step()
             tr_loss += loss.item(); c += 1
+        train_losses.append(tr_loss / max(1, c))
+
         model.eval(); v_acc = 0; v_loss = 0; vc = 0
         with torch.no_grad():
             for xb, yb in va_dl:
@@ -173,11 +175,9 @@ if __name__ == "__main__":
                 logits = model(xb)
                 v_loss += loss_fn(logits, yb).item()
                 v_acc += accuracy(logits, yb); vc += 1
-        tr_loss /= max(1,c); v_loss /= max(1,vc); v_acc /= max(1,vc)
-        print(f"[CNN] Epoch {ep:02d} train_loss={tr_loss:.4f} val_loss={v_loss:.4f} val_acc={v_acc:.3f}")
-        if v_acc > best_val:
-            best_val = v_acc
-            best_state = {k:v.cpu() for k,v in model.state_dict().items()}
+        val_losses.append(v_loss / max(1, vc))
+        val_accuracies.append(v_acc / max(1, vc))
+
 
     if best_state: model.load_state_dict(best_state)
 
@@ -191,3 +191,39 @@ if __name__ == "__main__":
 
     torch.save(model.state_dict(), "textcnn_hp.pt")
     print("Saved: textcnn_hp.pt")
+
+    import matplotlib.pyplot as plt
+
+    plt.plot(range(1, epochs+1), val_accuracies, label="Validation Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Validation Accuracy Over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("val_accuracy_plot.png")
+    plt.clf()
+
+    from sklearn.metrics import confusion_matrix
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    
+    all_preds, all_labels = [], []
+    
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in te_dl:
+            xb = xb.to(device)
+            logits = model(xb)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(yb.numpy())
+    
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=BOOKS, yticklabels=BOOKS)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Confusion Matrix (TextCNN)")
+    plt.savefig("confusion_matrix.png")
+    plt.clf()
+
