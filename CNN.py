@@ -1,11 +1,14 @@
 import os, json, string, random
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch.nn.functional as F
+from collections import defaultdict
 
 # ---------- Preprocessing ----------
 class TextPreProc:
@@ -56,6 +59,9 @@ class TextCNN(nn.Module):
         self.drop = nn.Dropout(drop)
         self.fc = nn.Linear(n_f * len(kernels), n_classes)  # classifier head
 
+        self.num_filters = n_f
+        self.kernel_sizes = kernels
+
     def forward(self, x):
         # x: [B, L] -> emb: [B, L, D] -> transpose to [B, D, L] for Conv1d
         x = self.emb(x).transpose(1, 2)
@@ -65,6 +71,112 @@ class TextCNN(nn.Module):
 
 def accuracy(logits, y):
     return (logits.argmax(1) == y).float().mean().item()
+
+def filter_info(model, dataloader, vocab, k = 10, batch_size = 1024, device = "cpu"):
+
+    loss_function = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    idx2word = {idx: word for word, idx in vocab.items()}
+
+    model.to(device)
+    model.eval()
+
+    num_filters = model.num_filters
+
+    all_activations = [defaultdict(list) for _ in model.kernel_sizes]
+    correct_counts = [defaultdict(int) for _ in model.kernel_sizes]
+    total_counts = [defaultdict(int) for _ in model.kernel_sizes]
+
+    W = model.fc.weight.data.cpu()
+    filter_class_identity = []
+    filter_offset = 0
+
+    for layer_idx in range(len(model.kernel_sizes)):
+
+        for f in range(num_filters):
+            col = filter_offset + f
+            class_id = torch.argmax(W[:, col]).item()
+            filter_class_identity.append(class_id)
+        filter_offset += num_filters
+
+    with torch.no_grad():
+        for page, book_number in dataloader:
+            page = page.to(device)
+            book_number = book_number.to(device)
+
+            logits = model(page)
+            loss = loss_function(logits, book_number)
+            total_loss += loss.item()
+
+            predictions = torch.argmax(logits, dim=1)
+            correct += (predictions == book_number).sum().item()
+            total += book_number.size(0)
+
+            embedded = model.emb(page)
+            embedded = embedded.permute(0, 2, 1)
+
+            filter_offset = 0
+            for layer_idx, (convolution, kernel_size) in enumerate(zip(model.convs, model.kernel_sizes)):
+                convolution_output = F.relu(convolution(embedded))
+                values, indices = convolution_output.max(dim=2)
+                B, num_f = values.shape
+
+                for b in range(B):
+                    for f in range(num_f):
+                        start = indices[b, f].item()
+                        end = start + kernel_size
+                        token_indices = page[b, start:end].tolist()
+                        words = [idx2word[t] for t in token_indices if t != 0]
+                        ngram_string = " ".join(words)
+                        activation = values[b, f].item()
+                        class_id = filter_class_identity[filter_offset + f]
+                        is_correct = int(class_id == book_number[b].item())
+
+                        all_activations[layer_idx][f].append(
+                            (ngram_string, activation, class_id, is_correct)
+                        )
+                        correct_counts[layer_idx][f] += is_correct
+                        total_counts[layer_idx][f] += 1
+
+                filter_offset += num_f
+
+    top_ngrams = [{} for _ in model.kernel_sizes]
+    identity_accuracy = [{} for _ in model.kernel_sizes]
+    for layer_idx, layer_dict in enumerate(all_activations):
+        for f, ngram_list in layer_dict.items():
+            ngram_list.sort(key=lambda x: x[1], reverse=True)
+            top_ngrams[layer_idx][f] = ngram_list[:k]
+            identity_accuracy[layer_idx][f] = (
+                correct_counts[layer_idx][f] / total_counts[layer_idx][f]
+            )
+
+    return avg_loss, accuracy, top_ngrams, identity_accuracy
+
+def visualize_filters(top_ngrams, identity_accuracy, kernel_sizes):
+
+    rows = []
+
+    for layer_idx, layer_dict in enumerate(top_ngrams):
+        for filter_idx, ngrams in layer_dict.items():
+            class_id = ngrams[0][2]
+            acc = identity_accuracy[layer_idx][filter_idx]
+            top_ngrams_str = ", ".join([f"'{ngram[0]}'" for ngram in ngrams])
+            
+            rows.append({
+                "Layer": layer_idx,
+                "Kernel Size": kernel_sizes[layer_idx],
+                "Filter": filter_idx,
+                "Class Identity": class_id,
+                "Identity Accuracy": f"{acc:.2f}",
+                "Top-k N-grams": top_ngrams_str
+            })
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(by=["Layer", "Filter"]).reset_index(drop=True)    
+    return df
 
 # ---------- Main ----------
 if __name__ == "__main__":
@@ -77,7 +189,7 @@ if __name__ == "__main__":
     # 1) Load Lab-1 encoder (HP1) on CPU safely
     print("Loading base encoder (HP1)...")
     emb = torch.load("word2vec_embeddings.pth", map_location=torch.device('cpu')).cpu()  # [V, D]
-    with open("vocab.json","r",encoding="utf-8") as f:
+    with open("./vocab.json","r",encoding="utf-8") as f:
         vocab = json.load(f)
     w2i = {w:i for i,w in enumerate(vocab)}
     d = emb.size(1)  # current embedding dimension D
@@ -124,7 +236,9 @@ if __name__ == "__main__":
     te_dl = DataLoader(te, batch_size=128)
 
     # 7) Model
-    model = TextCNN(len(vocab), d, emb, pad_idx, n_classes=len(BOOKS)).to(device)
+    num_filters = 100
+    kernel_sizes = [3, 4, 5] # change kernel widths / sizes
+    model = TextCNN(len(vocab), d, emb, pad_idx, n_f = num_filters, kernels = kernel_sizes, n_classes=len(BOOKS)).to(device)
     opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -158,6 +272,7 @@ if __name__ == "__main__":
     if best_state: model.load_state_dict(best_state)
 
     # 9) Test
+
     model.eval(); t_acc = 0; tc = 0
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -173,6 +288,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), "extended_encoder/textcnn_hp.pt")
     print("Model saved to 'extended_encoder'.")
 
+
     # 10) Evaluation artifacts
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds, target_names=BOOKS))
@@ -187,3 +303,24 @@ if __name__ == "__main__":
     plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("Validation Accuracy Over Epochs")
     plt.grid(True); plt.legend()
     plt.savefig("extended_encoder/val_accuracy_plot.png")
+
+
+    # 11) I
+    avg_loss, accuracy, top_ngrams, identity_accuracy = filter_info(
+        model, 
+        te_dl, 
+        w2i,
+        k = 10,
+        batch_size = 64, 
+        device = device
+    )
+
+    dataframe = visualize_filters(top_ngrams, identity_accuracy, kernel_sizes = [3, 4, 5])
+    dataframe = dataframe.sort_values(by = "Identity Accuracy", ascending = False) ;
+    top_effective_filters = dataframe.head(10)
+    print(top_effective_filters)
+
+    top_effective_filters = top_effective_filters[["Filter", "Top-k N-grams"]].to_numpy()
+
+    for i in range(5):
+        print(f'Filter {top_effective_filters[i][0]} \n {top_effective_filters[i][1]} \n')
