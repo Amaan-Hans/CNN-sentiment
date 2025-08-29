@@ -1,11 +1,13 @@
-import os, json, string, random
+import os, json, string, random, argparse, time, csv
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, random_split
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
 
 # ---------- Preprocessing ----------
 class TextPreProc:
@@ -14,6 +16,7 @@ class TextPreProc:
         return s.translate(str.maketrans('', '', string.punctuation + "“”‘’—…"))
 
 # ---------- Dataset Builder (each line = one page) ----------
+
 def build_pages(file_paths, pre, w2i, unk_idx):
     pages, labels, meta = [], [], []
     for book_id, fp in enumerate(file_paths):
@@ -68,21 +71,32 @@ def accuracy(logits, y):
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    random.seed(123); np.random.seed(123); torch.manual_seed(123)
+    # NEW: arguments
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kernels", type=str, default="3,4,5",
+                    help="comma-separated kernel sizes, e.g. 3,4,5 or 4,5,7")
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--nf", type=int, default=100, help="filters per kernel")
+    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--runs_csv", type=str,
+                    default="extended_encoder/runs/sweep_results.csv")
+    args = ap.parse_args()
+
+    kernels = tuple(int(k) for k in args.kernels.split(","))
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     BOOKS = ["HP1","HP2","HP3","HP4","HP5","HP6","HP7"]
     FILES = [f'./harry_potter_books/{b}.txt' for b in BOOKS]
 
-    # 1) Load Lab-1 encoder (HP1) on CPU safely
     print("Loading base encoder (HP1)...")
-    emb = torch.load("word2vec_embeddings.pth", map_location=torch.device('cpu')).cpu()  # [V, D]
+    emb = torch.load("word2vec_embeddings.pth", map_location=torch.device('cpu')).cpu()
     with open("vocab.json","r",encoding="utf-8") as f:
         vocab = json.load(f)
     w2i = {w:i for i,w in enumerate(vocab)}
-    d = emb.size(1)  # current embedding dimension D
+    d = emb.size(1)
 
-    # 2) Add PAD and UNK as extra rows
     PAD, UNK = "<pad>", "<unk>"
     if PAD not in w2i:
         w2i[PAD] = len(w2i); vocab.append(PAD)
@@ -92,19 +106,16 @@ if __name__ == "__main__":
         emb = torch.cat([emb, torch.zeros(1, d, device=emb.device)], dim=0)
     pad_idx = w2i[PAD]; unk_idx = w2i[UNK]
 
-    # 3) 
-    emb = torch.cat([emb, torch.zeros(emb.size(0), 1, device=emb.device)], dim=1)  # [V, D+1]
-    emb[unk_idx, -1] = 1.0  # only UNK has '1' in the last coordinate; others (incl. PAD) are 0
-    d = emb.size(1)  # update D -> D+1
+    # extend embedding dim by 1 and mark UNK
+    emb = torch.cat([emb, torch.zeros(emb.size(0), 1, device=emb.device)], dim=1)
+    emb[unk_idx, -1] = 1.0
+    d = emb.size(1)
 
-    # 4) Save extended encoder (after adding PAD/UNK + extra dimension)
     os.makedirs("extended_encoder", exist_ok=True)
     torch.save(emb, "extended_encoder/word2vec_extended.pth")
     with open("extended_encoder/vocab_extended.json","w",encoding="utf-8") as f:
         json.dump(vocab, f)
-    print("Extended encoder saved in 'extended_encoder'.")
 
-    # 5) Build dataset from ALL books (each line = page), OOV -> UNK
     pre = TextPreProc()
     pages, labels, meta = build_pages(FILES, pre, w2i, unk_idx)
     X = pad_pages(pages, pad_idx)
@@ -115,39 +126,39 @@ if __name__ == "__main__":
         json.dump(meta, f)
     print(f"Dataset saved. Pages: {len(pages)}  Max length: {X.size(1)}")
 
-    # 6) Split into train/val/test
     ds = TensorDataset(X, y)
     n = len(ds); n_train = int(0.8*n); n_val = int(0.1*n); n_test = n - n_train - n_val
-    tr, va, te = random_split(ds, [n_train, n_val, n_test], generator=torch.Generator().manual_seed(123))
+    tr, va, te = random_split(ds, [n_train, n_val, n_test],
+                              generator=torch.Generator().manual_seed(args.seed))
     tr_dl = DataLoader(tr, batch_size=64, shuffle=True)
     va_dl = DataLoader(va, batch_size=128)
     te_dl = DataLoader(te, batch_size=128)
 
-    # 7) Model
-    model = TextCNN(len(vocab), d, emb, pad_idx, n_classes=len(BOOKS)).to(device)
+    # NEW: use args.nf and args.dropout, freeze emb (per your request)
+    model = TextCNN(len(vocab), d, emb, pad_idx,
+                    n_classes=len(BOOKS),
+                    n_f=args.nf, kernels=kernels,
+                    drop=args.dropout, freeze=True).to(device)
     opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
 
-    best_val, best_state = 0.0, None
-    epochs = 20
-    val_accuracies = []
+    best_val, best_state, val_accuracies = 0.0, None, []
+    epochs = args.epochs
+    t0 = time.time()
 
-    # 8) Training loop
     for ep in range(1, epochs+1):
-        model.train(); tr_loss = 0; c = 0
+        model.train(); tr_loss = 0.0
         for xb, yb in tr_dl:
             xb, yb = xb.to(device), yb.to(device)
             loss = loss_fn(model(xb), yb)
             opt.zero_grad(); loss.backward(); opt.step()
-            tr_loss += loss.item(); c += 1
+            tr_loss += loss.item()
 
-        # Validation
-        model.eval(); v_acc = 0; vc = 0
+        model.eval(); v_acc = 0.0; vc = 0
         with torch.no_grad():
             for xb, yb in va_dl:
                 xb, yb = xb.to(device), yb.to(device)
-                logits = model(xb)
-                v_acc += accuracy(logits, yb); vc += 1
+                v_acc += accuracy(model(xb), yb); vc += 1
         v_acc /= max(1, vc)
         val_accuracies.append(v_acc)
         print(f"Epoch {ep}/{epochs}  Val Acc = {v_acc:.3f}")
@@ -156,9 +167,10 @@ if __name__ == "__main__":
             best_state = model.state_dict()
 
     if best_state: model.load_state_dict(best_state)
+    train_time_s = time.time() - t0
 
-    # 9) Test
-    model.eval(); t_acc = 0; tc = 0
+    # Test
+    model.eval(); t_acc = 0.0; tc = 0
     all_preds, all_labels = [], []
     with torch.no_grad():
         for xb, yb in te_dl:
@@ -168,22 +180,35 @@ if __name__ == "__main__":
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(yb.cpu().numpy())
             t_acc += accuracy(logits, yb); tc += 1
-    print(f"Test Accuracy = {t_acc/max(1,tc):.3f}")
+    test_acc = t_acc/max(1,tc)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro")
 
     torch.save(model.state_dict(), "extended_encoder/textcnn_hp.pt")
-    print("Model saved to 'extended_encoder'.")
 
-    # 10) Evaluation artifacts
+    # Artifacts (unchanged)
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds, target_names=BOOKS))
-
     cm = confusion_matrix(all_labels, all_preds)
     plt.figure(figsize=(8,6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=BOOKS, yticklabels=BOOKS)
     plt.xlabel("Predicted"); plt.ylabel("True"); plt.title("Confusion Matrix (TextCNN)")
     plt.savefig("extended_encoder/confusion_matrix.png"); plt.clf()
-
     plt.plot(range(1, epochs+1), val_accuracies, marker='o', label="Validation Accuracy")
     plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("Validation Accuracy Over Epochs")
     plt.grid(True); plt.legend()
     plt.savefig("extended_encoder/val_accuracy_plot.png")
+
+    # NEW: append a CSV row for this run
+    os.makedirs(os.path.dirname(args.runs_csv), exist_ok=True)
+    header = ["kernels","nf","dropout","seed","best_val_acc","test_acc","macro_f1","train_time_s"]
+    row = [list(kernels), args.nf, args.dropout, args.seed,
+           round(best_val,4), round(test_acc,4), round(macro_f1,4), round(train_time_s,2)]
+    new_file = not os.path.exists(args.runs_csv)
+    with open(args.runs_csv, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file: w.writerow(header)
+        w.writerow(row)
+
+    # Print test acc for launcher parsing
+    print(f"[RUN DONE] kernels={kernels} nf={args.nf} drop={args.dropout} "
+          f"seed={args.seed} | test_acc={test_acc:.4f}")
