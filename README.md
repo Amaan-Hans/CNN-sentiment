@@ -2,6 +2,12 @@
 
 This repository trains a small TextCNN to classify pages from the seven Harry Potter books by which book they came from. It demonstrates using pretrained word vectors (from `word2vec_embeddings.pth`) as an embedding initializer and a lightweight convolutional architecture for document/page-level text classification.
 
+# Report
+
+[View the report](.\CNN-sentiment\report.pdf)
+
+
+
 **Why this matters**
 - **Transfer learning:** shows how to initialise embeddings from pretrained vectors and extend them for unknown tokens.
 - **Efficiency:** TextCNN is fast to train and effective for short passage classification.
