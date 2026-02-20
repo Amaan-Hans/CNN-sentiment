@@ -4,7 +4,7 @@ This repository trains a small TextCNN to classify pages from the seven Harry Po
 
 # Report
 
-[View the report](.\CNN-sentiment\report.pdf)
+[View the report](./report.pdf)
 
 
 
